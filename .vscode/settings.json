@@ -1,0 +1,5 @@
+{
+  "yaml.schemas": {
+    "kubernetes://schema/v1@service": "file:///d%3A/Azure-ai/k8s/aiops-controller/deployment.yaml"
+  }
+}

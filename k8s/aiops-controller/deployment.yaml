@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-controller
+  namespace: aiops-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiops-controller
+  template:
+    metadata:
+      labels:
+        app: aiops-controller
+    spec:
+      serviceAccountName: aiops-controller-sa
+      containers:
+        - name: controller
+          image: docker.io/devgixa/aiops-controller:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          env:
+            - name: WATCH_NAMESPACE
+              value: "incident-demo"
+            - name: AIOPS_NAMESPACE
+              value: "aiops-system"
+            - name: AIOPS_REPORT_CONFIGMAP
+              value: "aiops-latest-incident-report"
+            - name: AZURE_OPENAI_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-openai-secret
+                  key: AZURE_OPENAI_ENDPOINT
+            - name: AZURE_OPENAI_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-openai-secret
+                  key: AZURE_OPENAI_KEY
+            - name: AZURE_OPENAI_DEPLOYMENT
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-openai-secret
+                  key: AZURE_OPENAI_DEPLOYMENT
+            - name: AZURE_OPENAI_API_VERSION
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-openai-secret
+                  key: AZURE_OPENAI_API_VERSION
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-controller
+  namespace: aiops-system
+spec:
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+  selector:
+    app: aiops-controller

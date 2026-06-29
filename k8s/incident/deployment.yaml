@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incident-demo
+  namespace: incident-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: incident-demo
+  template:
+    metadata:
+      labels:
+        app: incident-demo
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:broken-test
+        ports:
+        - containerPort: 80
