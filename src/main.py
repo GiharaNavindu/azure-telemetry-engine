@@ -136,26 +136,87 @@ async def startup_event():
 
 @app.get("/aiops", response_class=HTMLResponse)
 async def dashboard():
+    import html
     report_data = "{}"
     try:
         cm = core_v1.read_namespaced_config_map(name=CONFIGMAP_NAME, namespace=AIOPS_NAMESPACE)
         if cm.data and "report.json" in cm.data:
             report_data = cm.data["report.json"]
-    except: pass
+    except Exception as e:
+        logger.error(f"Error reading configmap: {e}")
     
     try:
         parsed_report = json.loads(report_data)
-        formatted_json = json.dumps(parsed_report, indent=4)
-        if parsed_report.get("status") == "healthy":
-            status_color, text_color = "bg-green-500", "text-green-400"
-        elif parsed_report.get("status") == "error":
-            status_color, text_color = "bg-yellow-500", "text-yellow-400"
-        else:
-            status_color, text_color = "bg-red-500", "text-red-400"
-    except:
-        formatted_json = report_data
-        status_color, text_color = "bg-gray-500", "text-gray-400"
+        if not isinstance(parsed_report, dict):
+            raise ValueError("Parsed JSON is not a dictionary")
+    except Exception as e:
+        logger.error(f"Error parsing report data: {e}")
+        parsed_report = {
+            "status": "error",
+            "symptom": f"Failed to parse report data: {report_data}",
+            "confidence": "Low"
+        }
+
+    status = parsed_report.get("status") or "Unknown"
     
+    # Render healthy screen if status is healthy
+    if str(status).lower() == "healthy":
+        return f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>AIOps Telemetry Dashboard</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <meta http-equiv="refresh" content="10">
+        </head>
+        <body class="bg-gray-950 text-gray-100 font-sans antialiased p-8 min-h-screen flex items-center justify-center">
+            <div class="max-w-md w-full bg-gray-900 rounded-2xl shadow-2xl border border-emerald-500/20 p-8 text-center">
+                <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-emerald-500/10 text-emerald-400 mb-6 border border-emerald-500/20">
+                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                </div>
+                <h1 class="text-2xl font-bold text-white mb-2">All Systems Operational</h1>
+                <p class="text-gray-400 text-sm mb-6">Watching namespace: <span class="text-blue-400 font-mono">{WATCH_NAMESPACE}</span></p>
+                <div class="inline-flex items-center space-x-2 bg-emerald-500/10 text-emerald-400 px-4 py-2 rounded-full border border-emerald-500/25 text-xs font-semibold uppercase tracking-wider">
+                    <span class="relative flex h-2 w-2">
+                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                    </span>
+                    <span>Healthy</span>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+    # Safely extract and escape all fields for rendering
+    status_esc = html.escape(str(status))
+    incident_type = html.escape(str(parsed_report.get("incident_type") or "Unknown"))
+    affected_resource = html.escape(str(parsed_report.get("affected_resource") or "None Detected"))
+    symptom = html.escape(str(parsed_report.get("symptom") or "No symptoms recorded"))
+    root_cause = html.escape(str(parsed_report.get("root_cause") or "Undetermined"))
+    file_to_fix = html.escape(str(parsed_report.get("file_to_fix") or "None"))
+    recommended_safe_next_steps = html.escape(str(parsed_report.get("recommended_safe_next_steps") or "No recommended steps provided"))
+    confidence = html.escape(str(parsed_report.get("confidence") or "Low"))
+
+    # Determine confidence badge colors
+    conf_lower = confidence.lower()
+    if "high" in conf_lower:
+        confidence_bg = "bg-emerald-500/10"
+        confidence_border = "border-emerald-500/20"
+        confidence_text = "text-emerald-400"
+    elif "medium" in conf_lower:
+        confidence_bg = "bg-amber-500/10"
+        confidence_border = "border-amber-500/20"
+        confidence_text = "text-amber-400"
+    else:
+        confidence_bg = "bg-rose-500/10"
+        confidence_border = "border-rose-500/20"
+        confidence_text = "text-rose-400"
+
     return f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -167,7 +228,8 @@ async def dashboard():
         <meta http-equiv="refresh" content="10">
     </head>
     <body class="bg-gray-950 text-gray-100 font-sans antialiased p-8 min-h-screen">
-        <div class="max-w-4xl mx-auto">
+        <div class="max-w-6xl mx-auto">
+            <!-- Header Section -->
             <div class="flex flex-col md:flex-row items-start md:items-center justify-between mb-8 border-b border-gray-800 pb-6">
                 <div>
                     <h1 class="text-3xl font-bold text-white tracking-tight">AIOps Telemetry Engine</h1>
@@ -175,19 +237,100 @@ async def dashboard():
                 </div>
                 <div class="mt-4 md:mt-0 flex items-center space-x-3 bg-gray-900 px-4 py-2 rounded-full border border-gray-800">
                     <span class="relative flex h-3 w-3">
-                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full {status_color} opacity-75"></span>
-                      <span class="relative inline-flex rounded-full h-3 w-3 {status_color}"></span>
+                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                      <span class="relative inline-flex rounded-full h-3 w-3 bg-rose-500"></span>
                     </span>
-                    <span class="text-sm font-medium text-gray-300">Live AI Polling</span>
+                    <span class="text-sm font-medium text-gray-300">Active Incident Detected</span>
                 </div>
             </div>
-            <div class="bg-gray-900 rounded-xl shadow-2xl border border-gray-800 overflow-hidden">
-                <div class="bg-gray-800/50 px-6 py-4 border-b border-gray-800 flex justify-between items-center">
-                    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Latest Azure OpenAI RCA Report</h2>
-                    <span class="text-xs text-gray-500 font-mono bg-gray-950 px-2 py-1 rounded">Auto-refresh: 10s</span>
+
+            <!-- Top Section Metrics/Badges -->
+            <div class="flex flex-wrap gap-4 mb-8">
+                <!-- Status Badge -->
+                <div class="flex items-center space-x-2 bg-rose-500/10 border border-rose-500/20 px-3 py-1.5 rounded-lg text-sm">
+                    <span class="text-gray-400 font-medium">Status:</span>
+                    <span class="text-rose-400 font-semibold">{status_esc}</span>
                 </div>
-                <div class="p-6 overflow-x-auto">
-                    <pre class="text-sm font-mono {text_color} drop-shadow-md"><code>{formatted_json}</code></pre>
+                <!-- Incident Type Badge -->
+                <div class="flex items-center space-x-2 bg-blue-500/10 border border-blue-500/20 px-3 py-1.5 rounded-lg text-sm">
+                    <span class="text-gray-400 font-medium">Incident Type:</span>
+                    <span class="text-blue-400 font-semibold">{incident_type}</span>
+                </div>
+                <!-- Confidence Level Badge -->
+                <div class="flex items-center space-x-2 {confidence_bg} border {confidence_border} px-3 py-1.5 rounded-lg text-sm">
+                    <span class="text-gray-400 font-medium">Confidence:</span>
+                    <span class="{confidence_text} font-semibold">{confidence}</span>
+                </div>
+            </div>
+
+            <!-- Cards Layout -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <!-- Card 1: Symptom & Affected Resource -->
+                <div class="bg-gray-900/60 rounded-xl border border-amber-500/30 p-6 flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="p-2 bg-amber-500/10 rounded-lg text-amber-400 border border-amber-500/25">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-white">Symptom & Resource</h3>
+                        </div>
+                        <div class="space-y-4">
+                            <div>
+                                <span class="text-xs font-semibold text-amber-400 uppercase tracking-wider">Affected Resource</span>
+                                <p class="text-sm font-mono text-gray-200 mt-1 bg-gray-950 p-2 rounded border border-gray-800 break-all">{affected_resource}</p>
+                            </div>
+                            <div>
+                                <span class="text-xs font-semibold text-amber-400 uppercase tracking-wider">Symptom</span>
+                                <p class="text-sm text-gray-300 mt-1 leading-relaxed">{symptom}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Card 2: Root Cause & Identified File -->
+                <div class="bg-gray-900/60 rounded-xl border border-rose-500/30 p-6 flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="p-2 bg-rose-500/10 rounded-lg text-rose-400 border border-rose-500/25">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-white">Root Cause Analysis</h3>
+                        </div>
+                        <div class="space-y-4">
+                            <div>
+                                <span class="text-xs font-semibold text-rose-400 uppercase tracking-wider">File to Fix</span>
+                                <p class="text-sm font-mono text-gray-200 mt-1 bg-gray-950 p-2 rounded border border-gray-800 break-all">{file_to_fix}</p>
+                            </div>
+                            <div>
+                                <span class="text-xs font-semibold text-rose-400 uppercase tracking-wider">Root Cause</span>
+                                <p class="text-sm text-gray-300 mt-1 leading-relaxed">{root_cause}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Card 3: Recommended Safe Next Steps -->
+                <div class="bg-gray-900/60 rounded-xl border border-emerald-500/30 p-6 flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="p-2 bg-emerald-500/10 rounded-lg text-emerald-400 border border-emerald-500/25">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold text-white">Recommended Actions</h3>
+                        </div>
+                        <div class="space-y-4">
+                            <div>
+                                <span class="text-xs font-semibold text-emerald-400 uppercase tracking-wider">Safe Next Steps</span>
+                                <p class="text-sm text-gray-300 mt-1 leading-relaxed">{recommended_safe_next_steps}</p>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
