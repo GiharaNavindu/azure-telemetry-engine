@@ -42,11 +42,36 @@ def gather_evidence():
         pods = core_v1.list_namespaced_pod(WATCH_NAMESPACE)
         for p in pods.items:
             statuses = []
+            struggling = False
             if p.status.container_statuses:
                 for c in p.status.container_statuses:
-                    if c.state.waiting:
-                        statuses.append({"reason": c.state.waiting.reason})
-            evidence["pods"].append({"name": p.metadata.name, "statuses": statuses})
+                    if c.state:
+                        if c.state.waiting:
+                            reason = c.state.waiting.reason
+                            statuses.append({"reason": reason})
+                            if reason in ['CrashLoopBackOff', 'Error', 'BackOff', 'ImagePullBackOff', 'ErrImagePull']:
+                                struggling = True
+                        if c.state.terminated:
+                            reason = c.state.terminated.reason
+                            statuses.append({"reason": reason})
+                            if reason in ['CrashLoopBackOff', 'Error', 'BackOff', 'ImagePullBackOff', 'ErrImagePull']:
+                                struggling = True
+                        if not c.state.running:
+                            struggling = True
+
+            pod_logs = ""
+            if struggling:
+                try:
+                    pod_logs = core_v1.read_namespaced_pod_log(name=p.metadata.name, namespace=WATCH_NAMESPACE, tail_lines=20)
+                except Exception as log_err:
+                    logger.warning(f"Could not read logs for pod {p.metadata.name}: {log_err}")
+                    pod_logs = f"Error reading logs: {str(log_err)}"
+
+            evidence["pods"].append({
+                "name": p.metadata.name,
+                "statuses": statuses,
+                "logs": pod_logs
+            })
 
         endpoints = core_v1.list_namespaced_endpoints(WATCH_NAMESPACE)
         for ep in endpoints.items:
@@ -71,8 +96,10 @@ def analyze_with_ai(evidence):
 
     has_issue = False
     for p in evidence["pods"]:
+        if p.get("logs"):
+            has_issue = True
         for s in p.get("statuses", []):
-            if s.get("reason") in ["ImagePullBackOff", "ErrImagePull", "BackOff"]:
+            if s.get("reason") in ["ImagePullBackOff", "ErrImagePull", "BackOff", "CrashLoopBackOff", "Error"]:
                 has_issue = True
     for ep in evidence["endpoints"]:
         if len(ep["addresses"]) == 0:
@@ -86,7 +113,13 @@ def analyze_with_ai(evidence):
         # clean_endpoint = endpoint.split("/openai")[0] 
         client_ai = AzureOpenAI(azure_endpoint=endpoint, api_key=key, api_version=api_version)
         
-        prompt = f"Analyze this K8s evidence in namespace {WATCH_NAMESPACE}:\n{json.dumps(evidence)}\nIdentify if there's a bad image tag or empty service endpoints. The repo is 'aks-gitops-sample-app'."
+        prompt = (
+            f"Analyze this K8s evidence in namespace {WATCH_NAMESPACE}:\n{json.dumps(evidence)}\n"
+            "Identify if there's a bad image tag, empty service endpoints, or runtime application errors. "
+            "Examine any application logs appended in the pod evidence (e.g. in `evidence['pods']`) to diagnose "
+            "runtime errors (such as missing environment configurations, db connection failures, or uncaught exceptions) "
+            "and suggest safe next steps. The repo is 'aks-gitops-sample-app'."
+        )
         
         response = client_ai.beta.chat.completions.parse(
             model=deployment,
