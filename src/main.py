@@ -18,6 +18,7 @@ app = FastAPI(title="AIOps Incident Analyzer")
 WATCH_NAMESPACE = os.getenv("WATCH_NAMESPACE", "incident-demo")
 AIOPS_NAMESPACE = os.getenv("AIOPS_NAMESPACE", "aiops-system")
 CONFIGMAP_NAME = os.getenv("AIOPS_REPORT_CONFIGMAP", "aiops-latest-incident-report")
+EXCLUDED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "aiops-system", AIOPS_NAMESPACE}
 
 try:
     config.load_incluster_config()
@@ -28,6 +29,7 @@ core_v1 = client.CoreV1Api()
 
 class IncidentRCA(BaseModel):
     status: str
+    namespace: Optional[str] = None
     incident_type: Optional[str] = None
     affected_resource: Optional[str] = None
     symptom: Optional[str] = None
@@ -39,8 +41,12 @@ class IncidentRCA(BaseModel):
 def gather_evidence():
     evidence = {"pods": [], "endpoints": []}
     try:
-        pods = core_v1.list_namespaced_pod(WATCH_NAMESPACE)
+        pods = core_v1.list_pod_for_all_namespaces()
         for p in pods.items:
+            ns = p.metadata.namespace
+            if ns in EXCLUDED_NAMESPACES:
+                continue
+                
             statuses = []
             struggling = False
             if p.status.container_statuses:
@@ -62,30 +68,39 @@ def gather_evidence():
             pod_logs = ""
             if struggling:
                 try:
-                    pod_logs = core_v1.read_namespaced_pod_log(name=p.metadata.name, namespace=WATCH_NAMESPACE, tail_lines=20)
+                    pod_logs = core_v1.read_namespaced_pod_log(name=p.metadata.name, namespace=ns, tail_lines=20)
                 except Exception as log_err:
-                    logger.warning(f"Could not read logs for pod {p.metadata.name}: {log_err}")
+                    logger.warning(f"Could not read logs for pod {p.metadata.name} in namespace {ns}: {log_err}")
                     pod_logs = f"Error reading logs: {str(log_err)}"
 
             evidence["pods"].append({
                 "name": p.metadata.name,
+                "namespace": ns,
                 "statuses": statuses,
                 "logs": pod_logs
             })
 
-        endpoints = core_v1.list_namespaced_endpoints(WATCH_NAMESPACE)
+        endpoints = core_v1.list_endpoints_for_all_namespaces()
         for ep in endpoints.items:
+            ns = ep.metadata.namespace
+            if ns in EXCLUDED_NAMESPACES:
+                continue
+                
             addresses = []
             if ep.subsets:
                 for sub in ep.subsets:
                     if sub.addresses:
                         addresses.extend([a.ip for a in sub.addresses])
-            evidence["endpoints"].append({"name": ep.metadata.name, "addresses": addresses})
+            evidence["endpoints"].append({
+                "name": ep.metadata.name,
+                "namespace": ns,
+                "addresses": addresses
+            })
     except Exception as e:
         logger.error(f"K8s API error: {e}")
     return evidence
 
-def analyze_with_ai(evidence):
+def analyze_with_ai(evidence, target_namespace=None):
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     key = os.getenv("AZURE_OPENAI_KEY")
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
@@ -114,11 +129,13 @@ def analyze_with_ai(evidence):
         client_ai = AzureOpenAI(azure_endpoint=endpoint, api_key=key, api_version=api_version)
         
         prompt = (
-            f"Analyze this K8s evidence in namespace {WATCH_NAMESPACE}:\n{json.dumps(evidence)}\n"
+            f"Analyze this K8s evidence across namespaces:\n{json.dumps(evidence)}\n"
+            f"The dynamic event occurred in namespace: {target_namespace or 'Unknown'}.\n"
             "Identify if there's a bad image tag, empty service endpoints, or runtime application errors. "
             "Examine any application logs appended in the pod evidence (e.g. in `evidence['pods']`) to diagnose "
-            "runtime errors (such as missing environment configurations, db connection failures, or uncaught exceptions) "
-            "and suggest safe next steps. The repo is 'aks-gitops-sample-app'."
+            "runtime errors (such as missing environment configurations, db connection failures, or uncaught exceptions). "
+            f"Set the 'namespace' field in the output to the namespace where the anomaly/incident is occurring (e.g. '{target_namespace or 'Unknown'}'). "
+            "The repo is 'aks-gitops-sample-app'."
         )
         
         response = client_ai.beta.chat.completions.parse(
@@ -130,7 +147,7 @@ def analyze_with_ai(evidence):
         return response.choices[0].message.content
     except Exception as e:
         logger.error(f"Azure OpenAI Error: {e}")
-        return json.dumps({"status": "error", "message": f"AI Engine Failed: {str(e)}"})
+        return json.dumps({"status": "error", "message": f"AI Engine Failed: {str(e)}", "namespace": target_namespace})
 
 def update_configmap(report_json):
     body = client.V1ConfigMap(
@@ -159,13 +176,17 @@ async def polling_loop():
     while True:
         w = watch.Watch()
         try:
-            logger.info(f"Starting Kubernetes watch stream for namespace {WATCH_NAMESPACE}...")
+            logger.info("Starting Kubernetes watch stream for all namespaces...")
             
             def process_events():
-                for event in w.stream(core_v1.list_namespaced_pod, namespace=WATCH_NAMESPACE, timeout_seconds=300):
+                for event in w.stream(core_v1.list_pod_for_all_namespaces, timeout_seconds=300):
                     event_type = event.get('type')
                     pod = event.get('object')
                     if not pod:
+                        continue
+                    
+                    ns = pod.metadata.namespace
+                    if ns in EXCLUDED_NAMESPACES:
                         continue
                     
                     if event_type in ['ADDED', 'MODIFIED']:
@@ -185,10 +206,10 @@ async def polling_loop():
                                             break
                         
                         if anomaly_detected:
-                            logger.info(f"Anomaly detected in pod {pod.metadata.name} (type: {event_type}). Triggering analysis...")
+                            logger.info(f"Anomaly detected in pod {pod.metadata.name} in namespace {ns} (type: {event_type}). Triggering analysis...")
                             try:
                                 evidence = gather_evidence()
-                                report = analyze_with_ai(evidence)
+                                report = analyze_with_ai(evidence, target_namespace=ns)
                                 update_configmap(report)
                             except Exception as ex:
                                 logger.error(f"Error in event handler analysis: {ex}")
@@ -231,6 +252,7 @@ async def dashboard():
         }
 
     status = parsed_report.get("status") or "Unknown"
+    ns_reported = parsed_report.get("namespace") or "Unknown"
     
     # Render healthy screen if status is healthy
     if str(status).lower() == "healthy":
@@ -252,7 +274,7 @@ async def dashboard():
                     </svg>
                 </div>
                 <h1 class="text-2xl font-bold text-white mb-2">All Systems Operational</h1>
-                <p class="text-gray-400 text-sm mb-6">Watching namespace: <span class="text-blue-400 font-mono">{WATCH_NAMESPACE}</span></p>
+                <p class="text-gray-400 text-sm mb-6">Monitoring all cluster namespaces (excluding platform/internal system namespaces)</p>
                 <div class="inline-flex items-center space-x-2 bg-emerald-500/10 text-emerald-400 px-4 py-2 rounded-full border border-emerald-500/25 text-xs font-semibold uppercase tracking-wider">
                     <span class="relative flex h-2 w-2">
                       <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -267,6 +289,7 @@ async def dashboard():
 
     # Safely extract and escape all fields for rendering
     status_esc = html.escape(str(status))
+    ns_esc = html.escape(str(ns_reported))
     incident_type = html.escape(str(parsed_report.get("incident_type") or "Unknown"))
     affected_resource = html.escape(str(parsed_report.get("affected_resource") or "None Detected"))
     symptom = html.escape(str(parsed_report.get("symptom") or "No symptoms recorded"))
@@ -306,7 +329,7 @@ async def dashboard():
             <div class="flex flex-col md:flex-row items-start md:items-center justify-between mb-8 border-b border-gray-800 pb-6">
                 <div>
                     <h1 class="text-3xl font-bold text-white tracking-tight">AIOps Telemetry Engine</h1>
-                    <p class="text-sm text-gray-400 mt-1">Watching namespace: <span class="text-blue-400 font-mono">{WATCH_NAMESPACE}</span></p>
+                    <p class="text-sm text-gray-400 mt-1">Monitoring: <span class="text-blue-400 font-mono">All Cluster Namespaces</span></p>
                 </div>
                 <div class="mt-4 md:mt-0 flex items-center space-x-3 bg-gray-900 px-4 py-2 rounded-full border border-gray-800">
                     <span class="relative flex h-3 w-3">
@@ -323,6 +346,11 @@ async def dashboard():
                 <div class="flex items-center space-x-2 bg-rose-500/10 border border-rose-500/20 px-3 py-1.5 rounded-lg text-sm">
                     <span class="text-gray-400 font-medium">Status:</span>
                     <span class="text-rose-400 font-semibold">{status_esc}</span>
+                </div>
+                <!-- Affected Namespace Badge -->
+                <div class="flex items-center space-x-2 bg-purple-500/10 border border-purple-500/20 px-3 py-1.5 rounded-lg text-sm">
+                    <span class="text-gray-400 font-medium">Affected Namespace:</span>
+                    <span class="text-purple-400 font-semibold">{ns_esc}</span>
                 </div>
                 <!-- Incident Type Badge -->
                 <div class="flex items-center space-x-2 bg-blue-500/10 border border-blue-500/20 px-3 py-1.5 rounded-lg text-sm">
