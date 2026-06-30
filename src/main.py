@@ -154,14 +154,54 @@ def update_configmap(report_json):
         logger.error(f"Unexpected error in update_configmap: {e}")
 
 async def polling_loop():
+    from kubernetes import watch
+    
     while True:
+        w = watch.Watch()
         try:
-            evidence = gather_evidence()
-            report = analyze_with_ai(evidence)
-            update_configmap(report)
+            logger.info(f"Starting Kubernetes watch stream for namespace {WATCH_NAMESPACE}...")
+            
+            def process_events():
+                for event in w.stream(core_v1.list_namespaced_pod, namespace=WATCH_NAMESPACE, timeout_seconds=300):
+                    event_type = event.get('type')
+                    pod = event.get('object')
+                    if not pod:
+                        continue
+                    
+                    if event_type in ['ADDED', 'MODIFIED']:
+                        anomaly_detected = False
+                        if pod.status and pod.status.container_statuses:
+                            for c in pod.status.container_statuses:
+                                if c.state:
+                                    if c.state.waiting:
+                                        reason = c.state.waiting.reason
+                                        if reason in ['CrashLoopBackOff', 'ErrImagePull', 'BackOff', 'ImagePullBackOff', 'Error']:
+                                            anomaly_detected = True
+                                            break
+                                    if c.state.terminated:
+                                        reason = c.state.terminated.reason
+                                        if reason in ['CrashLoopBackOff', 'ErrImagePull', 'BackOff', 'ImagePullBackOff', 'Error']:
+                                            anomaly_detected = True
+                                            break
+                        
+                        if anomaly_detected:
+                            logger.info(f"Anomaly detected in pod {pod.metadata.name} (type: {event_type}). Triggering analysis...")
+                            try:
+                                evidence = gather_evidence()
+                                report = analyze_with_ai(evidence)
+                                update_configmap(report)
+                            except Exception as ex:
+                                logger.error(f"Error in event handler analysis: {ex}")
+            
+            await asyncio.to_thread(process_events)
+            
         except Exception as e:
-            logger.error(f"Fatal crash in polling loop: {e}")
-        await asyncio.sleep(15)
+            logger.error(f"Watch connection error: {e}. Retrying in 5 seconds...")
+            try:
+                w.stop()
+            except:
+                pass
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup_event():
