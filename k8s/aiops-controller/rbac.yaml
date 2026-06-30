@@ -10,7 +10,7 @@ metadata:
   name: aiops-controller-clusterrole
 rules:
   - apiGroups: [""]
-    resources: ["pods", "services", "endpoints", "events", "configmaps"]
+    resources: ["pods", "pods/log","services", "endpoints", "events", "configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
